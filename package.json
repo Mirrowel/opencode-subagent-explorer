@@ -1,0 +1,97 @@
+{
+  "name": "@mirrowel/opencode-subagent-explorer",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode plugin for exploring and cleaning up subagent sessions of the current session",
+  "license": "MIT",
+  "author": "Mirrowel",
+  "homepage": "https://github.com/Mirrowel/opencode-subagent-explorer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mirrowel/opencode-subagent-explorer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Mirrowel/opencode-subagent-explorer/issues"
+  },
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./wizard": {
+      "types": "./dist/wizard.d.ts",
+      "import": "./dist/wizard.js"
+    },
+    "./sessions": {
+      "types": "./dist/sessions.d.ts",
+      "import": "./dist/sessions.js"
+    },
+    "./tui-host": {
+      "types": "./dist/tui-host.d.ts",
+      "import": "./dist/tui-host.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "tsconfig.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "subagent",
+    "session",
+    "cleanup"
+  ],
+  "oc-plugin": [
+    "server",
+    "tui"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui",
+    "build:tui": "bun scripts/build-tui.mjs",
+    "ci": "npm run release:intent:check && npm run ci:package",
+    "ci:package": "npm run typecheck && npm run build && npm run test:unit && npm run test:tui-reactivity && npm run test:tui-startup && npm run pack:dry-run && npm run test:tui-package",
+    "commit:check": "npm run ci",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
+    "pack:dry-run": "node scripts/pack-dry-run.mjs",
+    "release:intent": "node scripts/set-release-intent.mjs",
+    "release:intent:check": "node scripts/check-release-intent.mjs",
+    "test:unit": "node scripts/unit-tests.mjs",
+    "test:tui-reactivity": "bun --conditions=browser scripts/tui-reactivity-smoke.mjs",
+    "test:tui-package": "node scripts/tui-package-smoke.mjs",
+    "test:tui-startup": "node scripts/tui-startup-smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": ">=1.14.0",
+    "@opentui/solid": "^0.4.1",
+    "comment-json": "^4.2.5",
+    "solid-js": "1.9.12"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0"
+  }
+}
