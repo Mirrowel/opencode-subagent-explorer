@@ -126,6 +126,13 @@ export type TuiHostApi = {
   /** Router's active session id (v1: route.current walk; v2 adapter maps its
    * own notion). Optional — the explorer falls back to the newest session. */
   currentSessionID?: () => string | undefined
+  /**
+   * Dialog sizing scope. "standalone" (default): the wizard uses its OWN
+   * size kv keys and offers the size picker. "embedded": the wizard reads
+   * the embedding host's keys (Config Studio's ui-width/ui-height-percent)
+   * and hides the picker — the host's dialog settings rule.
+   */
+  dialogScope?: "standalone" | "embedded"
   theme: {
     readonly current: TuiHostTheme
   }

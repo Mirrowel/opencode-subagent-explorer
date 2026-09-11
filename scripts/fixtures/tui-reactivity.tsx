@@ -21,6 +21,7 @@ function fakeHostApi() {
   return {
     api: {
       theme: { get current() { return theme } },
+      kv: { get: (_key: string, fallback?: unknown) => fallback, set: () => undefined, ready: true },
       mode: { push: () => () => undefined },
       keymap: {
         registerLayer: (captured) => {
@@ -61,14 +62,14 @@ export async function verifyTreeDialogRenders() {
         onDone={(value) => done(value)}
       />
     ),
-    { width: 90, height: 20 },
+    { width: 60, height: 16 },
   )
   try {
     await app.flush()
     const layer = host.layer()
     if (!layer) throw new Error("tree dialog did not register its keymap layer")
     const names = layer.commands.map((command) => command.name)
-    for (const expected of ["up", "down", "select", "details", "cleanup", "refresh", "switch", "back"]) {
+    for (const expected of ["up", "down", "select", "details", "cleanup", "refresh", "switch", "size", "back"]) {
       if (!names.some((name) => name.endsWith(`.${expected}`))) throw new Error(`keymap layer missing .${expected} command`)
     }
     // Drive a real selection move through the captured layer. Selection
@@ -84,6 +85,13 @@ export async function verifyTreeDialogRenders() {
     if (spansAfter === spansBefore) throw new Error("selection move did not repaint the dialog")
     if (!frameBefore.includes("Review pair") || !frameBefore.includes("Historian pass")) throw new Error("tree dialog does not render row titles")
     if (!frameBefore.includes("running")) throw new Error("tree dialog does not render the running count")
+    // The [hidden] badge must stay on ONE line even at narrow widths.
+    for (const line of frameBefore.split("\n")) {
+      if (line.includes("[") && line.trimEnd().endsWith("[")) {
+        throw new Error(`[hidden] badge wrapped mid-token: ${JSON.stringify(line)}`)
+      }
+    }
+    if (!frameBefore.split("\n").some((line) => line.includes("[hidden]"))) throw new Error("[hidden] badge not rendered")
     void frameAfter
     // Selecting a row resolves the delete action.
     layer.commands.find((command) => command.name.endsWith(".select")).run()

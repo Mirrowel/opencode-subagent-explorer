@@ -14,7 +14,7 @@
 import type { TuiHostApi as TuiPluginApi } from "./tui-host.js"
 import type { ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
-import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import {
   buildSessionTree,
   cleanupTargets,
@@ -54,6 +54,7 @@ export type TreeAction =
   | { type: "cleanup" }
   | { type: "refresh" }
   | { type: "switch-root" }
+  | { type: "size" }
   | { type: "exit" }
 
 export async function loadExplorerData(api: TuiPluginApi, directory: string): Promise<ExplorerData | undefined> {
@@ -90,14 +91,98 @@ function themeOf(api: TuiPluginApi) {
   return api.theme.current
 }
 
-function cappedHeight(count: number, max: number, min = 1): number {
-  return Math.max(min, Math.min(count, max))
+// ---------------------------------------------------------------------------
+// Dialog sizing (same conventions as Config Studio / Agent Variants)
+// ---------------------------------------------------------------------------
+
+type DialogSize = "medium" | "large" | "xlarge"
+
+const OWN_SIZE_KV = "subagent-explorer.ui-width"
+const OWN_HEIGHT_PERCENT_KV = "subagent-explorer.ui-height-percent"
+const HOST_SIZE_KV = "config-studio.ui-width"
+const HOST_HEIGHT_PERCENT_KV = "config-studio.ui-height-percent"
+const HEIGHT_PERCENT_MIN = 25
+const HEIGHT_PERCENT_MAX = 100
+const HEIGHT_PRESETS = [
+  { key: "1", label: "compact", value: 35 },
+  { key: "2", label: "normal", value: 50 },
+  { key: "3", label: "tall", value: 70 },
+  { key: "4", label: "max", value: 100 },
+] as const
+const DIALOG_WIDTH_COLUMNS: Record<DialogSize, number> = { medium: 60, large: 88, xlarge: 116 }
+
+function isEmbedded(api: TuiPluginApi): boolean {
+  return (api as TuiPluginApi & { dialogScope?: "standalone" | "embedded" }).dialogScope === "embedded"
 }
 
-function maxListRows(terminalHeight: number, minRows = 6): number {
-  // 75% backdrop budget minus ~8 rows of chrome (header, hints, footer).
-  const budget = Math.floor((terminalHeight * 3) / 4) - 8
-  return Math.max(minRows, Math.min(24, budget))
+function sizeKey(api: TuiPluginApi): string {
+  return isEmbedded(api) ? HOST_SIZE_KV : OWN_SIZE_KV
+}
+
+function heightKey(api: TuiPluginApi): string {
+  return isEmbedded(api) ? HOST_HEIGHT_PERCENT_KV : OWN_HEIGHT_PERCENT_KV
+}
+
+function dialogSizeOf(api: TuiPluginApi): DialogSize {
+  const value = api.kv.get<DialogSize>(sizeKey(api), "large")
+  if (value === "medium" || value === "large" || value === "xlarge") return value
+  return "large"
+}
+
+function setDialogSize(api: TuiPluginApi, size: DialogSize) {
+  api.kv.set(sizeKey(api), size)
+  api.ui.dialog.setSize(size)
+}
+
+function nextDialogSize(api: TuiPluginApi): DialogSize {
+  const current = dialogSizeOf(api)
+  if (current === "medium") return "large"
+  if (current === "large") return "xlarge"
+  return "medium"
+}
+
+function clampHeightPercent(value: number) {
+  return Math.max(HEIGHT_PERCENT_MIN, Math.min(HEIGHT_PERCENT_MAX, Math.round(value)))
+}
+
+function dialogHeightPercent(api: TuiPluginApi): number {
+  const value = api.kv.get<number>(heightKey(api), 50)
+  return typeof value === "number" && Number.isFinite(value) ? clampHeightPercent(value) : 50
+}
+
+function setDialogHeightPercent(api: TuiPluginApi, value: number) {
+  api.kv.set(heightKey(api), clampHeightPercent(value))
+}
+
+function useDialogSize(api: TuiPluginApi) {
+  createEffect(() => api.ui.dialog.setSize(dialogSizeOf(api)))
+}
+
+/**
+ * Pure dialog-height budget (same math as Config Studio's computeDialogRows):
+ * OpenCode's dialog backdrop anchors at terminalHeight / 4, so a panel
+ * taller than 75% of the terminal overflows the bottom edge. The percent
+ * drives the request; the backdrop budget caps it.
+ */
+export function computeDialogRows(percent: number, terminalHeight: number, chromeRows: number, minRows: number) {
+  const clampedPercent = Math.min(100, Math.max(10, Math.max(1, Math.round(percent)) || 1))
+  const backdropBudget = Math.max(minRows + chromeRows, Math.floor(terminalHeight * 0.75) - 1)
+  const available = Math.max(minRows, backdropBudget - chromeRows)
+  const requested = Math.max(minRows, Math.floor((terminalHeight * clampedPercent) / 100) - chromeRows)
+  return { availableRows: available, targetRows: Math.min(requested, available) }
+}
+
+function listRows(api: TuiPluginApi, terminalHeight: number, chromeRows = 8, minRows = 3): number {
+  return computeDialogRows(dialogHeightPercent(api), terminalHeight, chromeRows, minRows).targetRows
+}
+
+/** Content width for width-aware column truncation. */
+function contentWidth(api: TuiPluginApi): number {
+  return DIALOG_WIDTH_COLUMNS[dialogSizeOf(api)] - 8
+}
+
+function cappedHeight(count: number, max: number, min = 1): number {
+  return Math.max(min, Math.min(count, max))
 }
 
 function truncate(text: string, width: number): string {
@@ -135,10 +220,16 @@ export function SubagentTreeDialog(props: {
 }) {
   const theme = () => themeOf(props.api)
   const dimensions = useTerminalDimensions()
+  useDialogSize(props.api)
   const popMode = props.api.mode.push("subagent-explorer.dialog")
   const [selected, setSelected] = createSignal(0)
   const current = createMemo(() => props.rows[selected()])
   let scroll: ScrollBoxRenderable | undefined
+  const listHeight = createMemo(() => cappedHeight(props.rows.length, listRows(props.api, dimensions().height)))
+  const agentWidth = 16
+  const badgeWidth = 9
+  const ageWidth = 9
+  const titleWidth = createMemo(() => Math.max(16, contentWidth(props.api) - agentWidth - badgeWidth - ageWidth - 4))
   const move = (delta: number) =>
     setSelected((value) => {
       const next = Math.max(0, Math.min(props.rows.length - 1, value + delta))
@@ -166,6 +257,7 @@ export function SubagentTreeDialog(props: {
     { name: `${commandPrefix}.cleanup`, title: "Clean up idle sessions", run: () => props.onDone({ type: "cleanup" }) },
     { name: `${commandPrefix}.refresh`, title: "Refresh", run: () => props.onDone({ type: "refresh" }) },
     { name: `${commandPrefix}.switch`, title: "Switch root session", run: () => props.onDone({ type: "switch-root" }) },
+    ...(isEmbedded(props.api) ? [] : [{ name: `${commandPrefix}.size`, title: "Dialog size", run: () => props.onDone({ type: "size" } as TreeAction) }]),
     { name: `${commandPrefix}.back`, title: "Exit", run: () => props.onDone({ type: "exit" }) },
   ]
   const unregister = props.api.keymap.registerLayer({
@@ -181,6 +273,7 @@ export function SubagentTreeDialog(props: {
       { key: "c", cmd: `${commandPrefix}.cleanup`, desc: "Cleanup idle" },
       { key: "r", cmd: `${commandPrefix}.refresh`, desc: "Refresh" },
       { key: "s", cmd: `${commandPrefix}.switch`, desc: "Switch root" },
+      ...(isEmbedded(props.api) ? [] : [{ key: "o", cmd: `${commandPrefix}.size`, desc: "Dialog size" }]),
       { key: "escape", cmd: `${commandPrefix}.back`, desc: "Exit" },
     ],
   })
@@ -207,7 +300,7 @@ export function SubagentTreeDialog(props: {
         </Show>
         <text fg={theme().textMuted}>{`${props.idleCount} idle`}</text>
       </box>
-      <scrollbox maxHeight={cappedHeight(props.rows.length, maxListRows(dimensions().height), 3)} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
+      <scrollbox maxHeight={listHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
         <box flexDirection="column" gap={0}>
           <Show
             when={props.rows.length > 0}
@@ -233,13 +326,13 @@ export function SubagentTreeDialog(props: {
                     onMouseOver={() => setSelected(index())}
                     onMouseUp={() => props.onDone({ type: "delete", row })}
                   >
-                    <text fg={titleFg()}>{row.running ? "▶" : "·"}</text>
-                    <text width={18} flexShrink={0} fg={active() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden"><b>{truncate(row.session.agent ?? "agent", 18)}</b></text>
+                    <text fg={titleFg()} flexShrink={0}>{row.running ? "▶" : "·"}</text>
+                    <text width={agentWidth} flexShrink={0} fg={active() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden"><b>{truncate(row.session.agent ?? "agent", agentWidth)}</b></text>
                     <Show when={row.hidden}>
-                      <text fg={badgeFg()}>{"[hidden]"}</text>
+                      <text width={badgeWidth} flexShrink={0} fg={badgeFg()} wrapMode="none" overflow="hidden">{"[hidden]"}</text>
                     </Show>
-                    <text flexGrow={1} fg={titleFg()} wrapMode="none" overflow="hidden">{truncate(rowTitle(row), 60)}</text>
-                    <text width={9} flexShrink={0} fg={active() ? theme().background : theme().textMuted}>{formatAge(row.session.updated ?? row.session.created)}</text>
+                    <text width={titleWidth()} flexGrow={1} fg={titleFg()} wrapMode="none" overflow="hidden">{truncate(rowTitle(row), titleWidth())}</text>
+                    <text width={ageWidth} flexShrink={0} fg={active() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden">{formatAge(row.session.updated ?? row.session.created)}</text>
                   </box>
                 )
               }}
@@ -253,6 +346,9 @@ export function SubagentTreeDialog(props: {
         <text fg={theme().textMuted}>c cleanup idle</text>
         <text fg={theme().textMuted}>r refresh</text>
         <text fg={theme().textMuted}>s switch session</text>
+        <Show when={!isEmbedded(props.api)}>
+          <text fg={theme().textMuted}>o size</text>
+        </Show>
       </box>
     </box>
   )
@@ -276,6 +372,7 @@ function showDangerConfirm(api: TuiPluginApi, props: { title: string; message: s
 
 function DangerConfirmDialog(props: { api: TuiPluginApi; title: string; message: string; confirmLabel: string; onDone: (value: boolean) => void }) {
   const theme = () => themeOf(props.api)
+  useDialogSize(props.api)
   const popMode = props.api.mode.push("subagent-explorer.confirm")
   const commandPrefix = `subagent-explorer.confirm.${Math.random().toString(36).slice(2)}`
   const unregister = props.api.keymap.registerLayer({
@@ -325,6 +422,7 @@ function showInfo(api: TuiPluginApi, props: { title: string; message: string }):
 function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; onDone: () => void }) {
   const theme = () => themeOf(props.api)
   const dimensions = useTerminalDimensions()
+  useDialogSize(props.api)
   const popMode = props.api.mode.push("subagent-explorer.info")
   const commandPrefix = `subagent-explorer.info.${Math.random().toString(36).slice(2)}`
   const unregister = props.api.keymap.registerLayer({
@@ -340,7 +438,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
     popMode()
   })
   const lines = props.message.split("\n")
-  const maxHeight = cappedHeight(lines.length, Math.floor((dimensions().height * 3) / 4) - 8, 3)
+  const maxHeight = cappedHeight(lines.length, listRows(props.api, dimensions().height, 6, 3))
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <text fg={theme().text}><b>{props.title}</b></text>
@@ -482,6 +580,210 @@ async function showDetails(api: TuiPluginApi, row: ExplorerRow): Promise<void> {
   await showInfo(api, { title: "Subagent session", message: lines.join("\n") })
 }
 
+// ---------------------------------------------------------------------------
+// Dialog size picker (same picker as Config Studio / Agent Variants)
+// ---------------------------------------------------------------------------
+
+type SizeSliderChoice = { action: "save" | "custom-height"; height: number }
+
+function showPrompt(api: TuiPluginApi, props: { title: string; placeholder?: string; value?: string }): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: string | undefined) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () =>
+        api.ui.DialogPrompt({
+          title: props.title,
+          placeholder: props.placeholder,
+          value: props.value,
+          onConfirm: (value) => done(value),
+          onCancel: () => done(undefined),
+        }),
+      () => done(undefined),
+    )
+  })
+}
+
+async function showSizeSlider(api: TuiPluginApi): Promise<SizeSliderChoice | undefined> {
+  let current = dialogHeightPercent(api)
+  while (true) {
+    const choice = await showSizeSliderOnce(api, current)
+    if (!choice) return undefined
+    current = choice.height
+    if (choice.action === "save") return choice
+
+    const input = await showPrompt(api, {
+      title: "Dialog height percent",
+      placeholder: `${HEIGHT_PERCENT_MIN}-${HEIGHT_PERCENT_MAX}`,
+      value: String(current),
+    })
+    if (input === undefined) continue
+    const value = Number(input)
+    if (!Number.isFinite(value)) {
+      await showInfo(api, { title: "Invalid height", message: `Enter a number from ${HEIGHT_PERCENT_MIN} to ${HEIGHT_PERCENT_MAX}.` })
+      continue
+    }
+    current = clampHeightPercent(value)
+  }
+}
+
+function showSizeSliderOnce(api: TuiPluginApi, current: number): Promise<SizeSliderChoice | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: SizeSliderChoice | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <SizeSliderDialog api={api} current={current} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+function SizeSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (value: SizeSliderChoice | undefined) => void }) {
+  const theme = () => themeOf(props.api)
+  const dimensions = useTerminalDimensions()
+  useDialogSize(props.api)
+  const [height, setHeight] = createSignal(clampHeightPercent(props.current))
+  const popMode = props.api.mode.push("subagent-explorer.size")
+  const commandPrefix = `subagent-explorer.size.${Math.random().toString(36).slice(2)}`
+
+  const cycleWidth = () => setDialogSize(props.api, nextDialogSize(props.api))
+  const setPreset = (preset: string) => {
+    const found = HEIGHT_PRESETS.find((item) => item.label === preset)
+    if (found) setHeight(found.value)
+  }
+  const move = (delta: number) => setHeight((value) => clampHeightPercent(value + delta))
+
+  const sliderWidth = createMemo(() => (dialogSizeOf(props.api) === "xlarge" ? 64 : dialogSizeOf(props.api) === "large" ? 48 : 34))
+  const sliderCells = createMemo(() => {
+    const width = sliderWidth()
+    const selected = Math.round(((height() - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1))
+    const presetPositions = new Map(HEIGHT_PRESETS.map((preset) => [Math.round(((preset.value - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1)), preset.label]))
+    return Array.from({ length: width }, (_, index) => {
+      const isCurrent = index === selected
+      const preset = presetPositions.get(index)
+      return {
+        char: isCurrent ? "●" : preset ? "│" : index < selected ? "━" : "─",
+        color: isCurrent ? theme().primary : preset ? theme().accent : index < selected ? theme().success : theme().textMuted,
+      }
+    })
+  })
+
+  /** Live mini preview: a mock dialog box scaled to the current settings.
+   * Uses computeDialogRows so the preview shows the TRUE capped height. */
+  const preview = createMemo(() => {
+    const widthColumns = DIALOG_WIDTH_COLUMNS[dialogSizeOf(props.api)]
+    const previewWidth = Math.max(10, Math.min(sliderWidth() + 4, 72))
+    const scale = previewWidth / widthColumns
+    const metrics = computeDialogRows(height(), dimensions().height, 6, 4)
+    const effective = metrics.targetRows
+    const requested = Math.floor((dimensions().height * Math.min(100, Math.max(25, height()))) / 100)
+    const rows = Math.max(4, Math.round(effective * scale))
+    const fill = (text: string, width: number) => {
+      const inner = width - 2
+      const slice = text.length > inner ? text.slice(0, inner - 1) + "…" : text
+      return `│${slice}${" ".repeat(Math.max(0, inner - slice.length))}│`
+    }
+    const lines: string[] = []
+    lines.push(`┌${"─".repeat(previewWidth - 2)}┐`)
+    lines.push(fill(`Subagent Explorer (preview)${effective < requested ? " [capped]" : ""}`, previewWidth))
+    for (let index = 0; index < rows - 3; index++) lines.push(fill("", previewWidth))
+    lines.push(`└${"─".repeat(previewWidth - 2)}┘`)
+    return lines
+  })
+
+  const shield = (ctx: { event?: { preventDefault?: () => void; stopPropagation?: () => void } }) => {
+    ctx.event?.preventDefault?.()
+    ctx.event?.stopPropagation?.()
+  }
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.width`, title: "Cycle width", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); cycleWidth() } },
+      { name: `${commandPrefix}.left`, title: "Lower height", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); move(-1) } },
+      { name: `${commandPrefix}.right`, title: "Raise height", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); move(1) } },
+      { name: `${commandPrefix}.down`, title: "Lower height faster", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); move(-5) } },
+      { name: `${commandPrefix}.up`, title: "Raise height faster", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); move(5) } },
+      { name: `${commandPrefix}.compact`, title: "Compact preset", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); setPreset("compact") } },
+      { name: `${commandPrefix}.normal`, title: "Normal preset", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); setPreset("normal") } },
+      { name: `${commandPrefix}.tall`, title: "Tall preset", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); setPreset("tall") } },
+      { name: `${commandPrefix}.max`, title: "Max preset", run: (ctx: Parameters<typeof shield>[0]) => { shield(ctx); setPreset("max") } },
+      { name: `${commandPrefix}.custom`, title: "Custom percent", run: () => props.onDone({ action: "custom-height", height: height() }) },
+      { name: `${commandPrefix}.save`, title: "Save", run: () => { setDialogHeightPercent(props.api, height()); props.onDone({ action: "save", height: height() }) } },
+      { name: `${commandPrefix}.back`, title: "Back", run: () => props.onDone(undefined) },
+    ],
+    bindings: [
+      { key: "w", cmd: `${commandPrefix}.width`, desc: "Cycle width" },
+      { key: "left", cmd: `${commandPrefix}.left`, desc: "Lower height" },
+      { key: "right", cmd: `${commandPrefix}.right`, desc: "Raise height" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Lower height faster" },
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Raise height faster" },
+      { key: "1", cmd: `${commandPrefix}.compact`, desc: "Compact preset" },
+      { key: "2", cmd: `${commandPrefix}.normal`, desc: "Normal preset" },
+      { key: "3", cmd: `${commandPrefix}.tall`, desc: "Tall preset" },
+      { key: "4", cmd: `${commandPrefix}.max`, desc: "Max preset" },
+      { key: "c", cmd: `${commandPrefix}.custom`, desc: "Custom percent" },
+      { key: "enter", cmd: `${commandPrefix}.save`, desc: "Save" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>Dialog size</b></text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
+      </box>
+      <box flexDirection="row" gap={0} width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>Width: </text>
+        <text fg={theme().primary}><b>{dialogSizeOf(props.api)}</b></text>
+        <text fg={theme().textMuted}> ({DIALOG_WIDTH_COLUMNS[dialogSizeOf(props.api)]} cols, w to cycle)   Height: </text>
+        <text fg={theme().primary}><b>{height()}%</b></text>
+      </box>
+      <box flexDirection="row" width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>{HEIGHT_PERCENT_MIN}% </text>
+        <For each={sliderCells()}>{(cell) => <text fg={cell.color}>{cell.char}</text>}</For>
+        <text fg={theme().textMuted}> {HEIGHT_PERCENT_MAX}%</text>
+      </box>
+      <box flexDirection="row" gap={2} marginBottom={1}>
+        <box flexDirection="column" gap={0}>
+          <For each={HEIGHT_PRESETS}>
+            {(preset) => <text fg={height() === preset.value ? theme().primary : theme().textMuted}>{preset.key} {preset.label}: {preset.value}%</text>}
+          </For>
+          <text fg={theme().textMuted}> </text>
+          <text fg={theme().textMuted}>left/right 1%</text>
+          <text fg={theme().textMuted}>up/down 5%</text>
+          <text fg={theme().textMuted}>c custom</text>
+        </box>
+        <box flexDirection="column" gap={0}>
+          <For each={preview()}>
+            {(line) => <text fg={theme().textMuted}>{line}</text>}
+          </For>
+        </box>
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%">
+        <text fg={theme().textMuted}>enter save</text>
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={() => { setDialogHeightPercent(props.api, height()); props.onDone({ action: "save", height: height() }) }}>
+          <text fg={theme().background}><b>save</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
 /** The explorer entry point: runs the tree browser loop until the user exits. */
 export async function mainMenu(api: TuiPluginApi): Promise<void> {
   const directory = api.state.path?.directory ?? api.state.path?.worktree ?? ""
@@ -517,6 +819,10 @@ export async function mainMenu(api: TuiPluginApi): Promise<void> {
     })
     if (!action || action.type === "exit") return
     if (action.type === "refresh") continue
+    if (action.type === "size") {
+      await showSizeSlider(api)
+      continue
+    }
     if (action.type === "switch-root") {
       const next = await showRootPicker(api, data.sessions, rootID)
       if (next) rootOverride = next

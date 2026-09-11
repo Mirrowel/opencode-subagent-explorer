@@ -51,9 +51,10 @@ function registerExplorerCommand(api: import("@opencode-ai/plugin/tui").TuiPlugi
 const tui: TuiPlugin = async (api) => {
   const unregister = registerExplorerCommand(api, async () => {
     // The v1 api satisfies TuiHostApi structurally; enrich it with the
-    // router's current-session signal.
+    // router's current-session signal and the standalone sizing scope.
     const host = api as unknown as TuiHostApi & { route?: { current?: { name: string; params?: { sessionID?: string } } } }
     host.currentSessionID = () => (host.route?.current?.name === "session" ? host.route.current.params?.sessionID : undefined)
+    host.dialogScope = "standalone"
     await mainMenu(host)
   })
 
