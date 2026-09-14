@@ -12,9 +12,11 @@ import {
   deleteSession,
   fetchActiveSessionIDs,
   fetchSessions,
+  fetchVariantAttribution,
   formatAge,
   hiddenAgentIDs,
   isHiddenAgent,
+  loadAvSidecar,
   normalizeSession,
   parentCandidates,
 } from "../dist/sessions.js"
@@ -161,6 +163,37 @@ class FakeSessionNamespace {
 
   ok(await fetchActiveSessionIDs({ session: {} }) === undefined, "no methods -> undefined")
 
+  // Presence-based active map: falsy values still count as running (matches
+  // the studio reload coordinator's proven probing).
+  {
+    const calls = []
+    const fake = {
+      session: {
+        active: async function () {
+          calls.push("active")
+          if (this !== fake.session) throw new Error("detached")
+          return { data: { ses_a: 0, ses_b: false, ses_c: { drains: 1 } } }
+        },
+      },
+    }
+    const ids = await fetchActiveSessionIDs(fake)
+    ok(ids?.has("ses_a") && ids?.has("ses_b") && ids?.has("ses_c") && ids?.size === 3, "active map membership means running, regardless of value truthiness")
+  }
+
+  // Status fallback reads `.type` (runtime shape), treats undefined as running.
+  {
+    const fake = {
+      session: {
+        status: async function () {
+          if (this !== fake.session) throw new Error("detached")
+          return { data: { ses_a: { type: "busy" }, ses_b: { type: "idle" }, ses_c: { type: "retry" }, ses_d: { type: undefined } } }
+        },
+      },
+    }
+    const ids = await fetchActiveSessionIDs(fake)
+    ok(ids?.has("ses_a") && ids?.has("ses_c") && ids?.has("ses_d") && !ids?.has("ses_b"), "status fallback: busy/retry/undefined = running, idle = not")
+  }
+
   const deleter = new FakeSessionNamespace("flat-envelope")
   ok((await deleteSession({ session: deleter }, "s1")) === true, "deleteSession uses session.delete attached")
   ok(deleter.calls[0]?.sessionID === "s1", "deleteSession sends the flat param shape first")
@@ -237,6 +270,61 @@ class FakeSessionNamespace {
   ok(server.id === "subagent-explorer" && typeof server.server === "function" && typeof server.setup === "function", "server default is dual-target {id, server, setup}")
   const tui = (await import("../dist/tui.js")).default
   ok(tui.id === "subagent-explorer" && typeof tui.tui === "function" && typeof tui.setup === "function", "tui default is dual-target {id, tui, setup}")
+}
+
+// --- AV awareness: sidecar loading ---
+
+{
+  const empty = loadAvSidecar(join(tmpdir(), "definitely-missing-dir-xyz"))
+  ok(empty.parents.size === 0, "missing sidecar -> empty parents (fail-soft)")
+
+  const home = mkdtempSync(join(tmpdir(), "se-av-"))
+  writeFileSync(
+    join(home, "agent-variants.jsonc"),
+    `// agent-variants sidecar
+{
+  "agents": {
+    "explore": { "parent": {}, "disable_base": true, "variants": { "explore-light": {} } },
+    "general": { "parent": {}, "disable_base": true, "disable": true, "variants": {} },
+    "plan": { "parent": {}, "variants": {} },
+  },
+}`,
+    "utf8",
+  )
+  const sidecar = loadAvSidecar(home)
+  ok(sidecar.parents.get("explore")?.disableBase === true, "sidecar: disable_base parsed")
+  ok(sidecar.parents.get("general")?.disableBase === false, "sidecar: full disable beats disable_base")
+  ok(sidecar.parents.get("plan")?.disableBase === false, "sidecar: plain parent not base-disabled")
+  ok(sidecar.parents.size === 3, "sidecar: all parents parsed (comments tolerated)")
+  rmSync(home, { recursive: true, force: true })
+}
+
+// --- AV awareness: variant attribution from task-part metadata ---
+
+{
+  const parts = [
+    {
+      parts: [
+        { type: "tool", tool: "task", state: { metadata: { sessionId: "ses_light", agentVariants: { alias: "explore-light", routedAgent: "explore" } } } },
+        { type: "tool", tool: "task", state: { metadata: { sessionId: "ses_plain", agentVariants: { alias: "plan-basic", routedAgent: "plan" } } } },
+      ],
+    },
+    { parts: [{ type: "text", text: "not a task part" }] },
+  ]
+  const client = {
+    session: {
+      messages: async function (args) {
+        if (this !== client.session) throw new Error("detached")
+        ok(args.sessionID === "ses_parent" || args.path?.id === "ses_parent", "attribution fetch targets the root session")
+        return { data: parts }
+      },
+    },
+  }
+  const map = await fetchVariantAttribution(client, "ses_parent", "C:/x", new Set(["explore", "plan"]))
+  ok(map.get("ses_light")?.alias === "explore-light" && map.get("ses_light")?.parent === "explore", "attribution: alias + parent extracted")
+  ok(map.get("ses_plain")?.alias === "plan-basic", "attribution: second variant captured")
+  const none = await fetchVariantAttribution(client, "ses_parent", "C:/x", new Set())
+  ok(none.size === 0, "attribution: skipped entirely without AV parents")
 }
 
 console.log(`unit tests passed (${passed} checks)`)

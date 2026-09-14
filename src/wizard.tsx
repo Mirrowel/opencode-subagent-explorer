@@ -24,13 +24,16 @@ import {
   fetchActiveSessionIDs,
   fetchSessionDetails,
   fetchSessions,
+  fetchVariantAttribution,
   formatAge,
   hiddenAgentIDs,
   isHiddenAgent,
+  loadAvSidecar,
   parentCandidates,
   type CleanupPlan,
   type SessionLite,
   type SessionTreeNode,
+  type VariantAttribution,
 } from "./sessions.js"
 
 export type ExplorerRow = {
@@ -38,6 +41,7 @@ export type ExplorerRow = {
   depth: number
   running: boolean
   hidden: boolean
+  variant?: { alias: string; parent: string }
 }
 
 export type ExplorerData = {
@@ -46,6 +50,10 @@ export type ExplorerData = {
   activeKnown: boolean
   hidden: Set<string>
   configAgents: Set<string>
+  /** child session id -> creating AV variant (recent history only). */
+  variantOf: VariantAttribution
+  /** AV sidecar parents (empty when agent-variants is not installed). */
+  avParents: Map<string, { disableBase: boolean }>
 }
 
 export type TreeAction =
@@ -57,16 +65,30 @@ export type TreeAction =
   | { type: "size" }
   | { type: "exit" }
 
-export async function loadExplorerData(api: TuiPluginApi, directory: string): Promise<ExplorerData | undefined> {
+function globalConfigDirOf(api: TuiPluginApi): string | undefined {
+  const config = api.state.path?.config
+  if (!config) return undefined
+  const index = Math.max(config.lastIndexOf("/"), config.lastIndexOf("\\"))
+  return index > 0 ? config.slice(0, index) : undefined
+}
+
+export async function loadExplorerData(api: TuiPluginApi, directory: string, rootOverride?: string): Promise<ExplorerData | undefined> {
   const sessions = await fetchSessions(api.client, directory)
   if (!sessions) return undefined
-  const activeIDs = await fetchActiveSessionIDs(api.client)
+  const [activeIDs, avSidecar] = await Promise.all([
+    fetchActiveSessionIDs(api.client),
+    Promise.resolve(loadAvSidecar(globalConfigDirOf(api))),
+  ])
+  const rootID = rootOverride ?? currentSessionID(api.currentSessionID?.(), sessions)
+  const variantOf = await fetchVariantAttribution(api.client, rootID, directory, new Set(avSidecar.parents.keys()))
   return {
     sessions,
     activeIDs,
     activeKnown: activeIDs !== undefined,
     hidden: hiddenAgentIDs(api.state.config),
     configAgents: configAgentIDs(api.state.config),
+    variantOf,
+    avParents: avSidecar.parents,
   }
 }
 
@@ -74,17 +96,26 @@ export function explorerRows(tree: SessionTreeNode[], data: ExplorerData): Explo
   const rows: ExplorerRow[] = []
   const walk = (nodes: SessionTreeNode[], depth: number) => {
     for (const node of nodes) {
+      const variant = data.variantOf.get(node.session.id)
       rows.push({
         session: node.session,
         depth,
         running: data.activeIDs?.has(node.session.id) ?? false,
-        hidden: isHiddenAgent(node.session.agent, data.hidden, data.configAgents),
+        // Variant children are normal sessions re-attributed to their alias;
+        // only the base agent itself (or non-AV hidden agents) carries the
+        // hidden badge.
+        hidden: variant ? false : isHiddenAgent(node.session.agent, data.hidden, data.configAgents),
+        variant,
       })
       walk(node.children, depth + 1)
     }
   }
   walk(tree, 0)
   return rows
+}
+
+export function agentLabelOf(row: Pick<ExplorerRow, "session" | "variant">): string {
+  return row.variant?.alias ?? row.session.agent ?? "unknown"
 }
 
 function themeOf(api: TuiPluginApi) {
@@ -327,7 +358,7 @@ export function SubagentTreeDialog(props: {
                     onMouseUp={() => props.onDone({ type: "delete", row })}
                   >
                     <text fg={titleFg()} flexShrink={0}>{row.running ? "▶" : "·"}</text>
-                    <text width={agentWidth} flexShrink={0} fg={active() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden"><b>{truncate(row.session.agent ?? "agent", agentWidth)}</b></text>
+                    <text width={agentWidth} flexShrink={0} fg={active() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden"><b>{truncate(agentLabelOf(row), agentWidth)}</b></text>
                     <Show when={row.hidden}>
                       <text width={badgeWidth} flexShrink={0} fg={badgeFg()} wrapMode="none" overflow="hidden">{"[hidden]"}</text>
                     </Show>
@@ -480,7 +511,7 @@ function showConfirm(api: TuiPluginApi, props: { title: string; message: string 
 
 async function deleteOne(api: TuiPluginApi, row: ExplorerRow): Promise<boolean> {
   const label = `${rowTitle(row)}${row.hidden ? " [hidden agent]" : ""}`
-  const summary = `${label}\nagent: ${row.session.agent ?? "unknown"}\nlast activity: ${formatAge(row.session.updated ?? row.session.created)}\n\nDeleting a session permanently removes it, its messages, and its history. The parent session keeps the task result text; only the jump target is lost.`
+  const summary = `${label}\n${row.variant ? `variant: ${row.variant.alias} (of ${row.variant.parent})` : `agent: ${row.session.agent ?? "unknown"}`}\nlast activity: ${formatAge(row.session.updated ?? row.session.created)}\n\nDeleting a session permanently removes it, its messages, and its history. The parent session keeps the task result text; only the jump target is lost.`
   const confirmed = row.running
     ? await showDangerConfirm(api, {
         title: "Delete RUNNING subagent session?",
@@ -556,16 +587,29 @@ function showRootPicker(api: TuiPluginApi, sessions: SessionLite[], currentRoot:
   })
 }
 
-async function showDetails(api: TuiPluginApi, row: ExplorerRow): Promise<void> {
+async function showDetails(api: TuiPluginApi, row: ExplorerRow, data: ExplorerData): Promise<void> {
   const details = await fetchSessionDetails(api.client, row.session.id)
+  const parentAgent = row.session.agent ?? "unknown"
   const lines = [
     `title: ${rowTitle(row)}`,
-    `agent: ${row.session.agent ?? "unknown"}${row.hidden ? " (hidden/background)" : ""}`,
+    row.variant
+      ? `variant: ${row.variant.alias} (of ${row.variant.parent})`
+      : `agent: ${parentAgent}${row.hidden ? " (hidden/background)" : ""}`,
+  ]
+  if (row.variant) {
+    const parentEntry = data.avParents.get(row.variant.parent)
+    if (parentEntry) {
+      lines.push(`base ${row.variant.parent}: ${parentEntry.disableBase ? "disabled (variants only)" : "enabled"}`)
+    }
+  } else if (data.avParents.has(parentAgent)) {
+    lines.push(`base ${parentAgent}: ${data.avParents.get(parentAgent)?.disableBase ? "disabled (variants only)" : "enabled"}`)
+  }
+  lines.push(
     `session: ${row.session.id}`,
     `status: ${row.running ? "running" : "idle"}`,
     `created: ${formatAge(row.session.created)}`,
     `last activity: ${formatAge(row.session.updated ?? row.session.created)}`,
-  ]
+  )
   if (details) {
     lines.push(`messages: ${details.messageCount}`)
     if (details.model) lines.push(`last model: ${details.model}`)
@@ -793,7 +837,7 @@ export async function mainMenu(api: TuiPluginApi): Promise<void> {
   }
   let rootOverride: string | undefined
   while (true) {
-    const data = await loadExplorerData(api, directory)
+    const data = await loadExplorerData(api, directory, rootOverride)
     if (!data) {
       await showInfo(api, {
         title: "Subagent Explorer",
@@ -833,7 +877,7 @@ export async function mainMenu(api: TuiPluginApi): Promise<void> {
       continue
     }
     if (action.type === "details") {
-      await showDetails(api, action.row)
+      await showDetails(api, action.row, data)
       continue
     }
     if (action.type === "cleanup") {

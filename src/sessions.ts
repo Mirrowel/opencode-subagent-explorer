@@ -5,6 +5,7 @@
  * timeout-bounded, and envelope-unwrapping ({data} vs raw) so one code path
  * serves the v1 and v2 hosts and the studio embed alike.
  */
+import { existsSync, readFileSync } from "node:fs"
 
 export type SessionLite = {
   id: string
@@ -99,31 +100,118 @@ export async function fetchSessions(client: unknown, directory: string): Promise
 /** Running session ids via `session.active()` with the `session.status()`
  * fallback (busy/retry = running). `undefined` when neither exists or both
  * fail — callers must treat that as "unknown", never "idle". */
+/**
+ * Running session ids via `session.active()` with the `session.status()`
+ * fallback (busy/retry/unknown-type = running). Mirrors the Config Studio
+ * reload coordinator's proven probing: PRESENCE in the active map means
+ * running (values may be falsy and must not be filtered), the status map
+ * keys carry `.type` (not `.status`), and all calls stay attached to the
+ * namespace object (SDK methods dereference `this`). `undefined` when
+ * neither exists or both fail - callers must treat that as "unknown",
+ * never "idle".
+ */
 export async function fetchActiveSessionIDs(client: unknown): Promise<Set<string> | undefined> {
   const namespace = (client as { session?: Record<string, any> } | undefined)?.session
   if (!namespace) return undefined
   if (typeof namespace.active === "function") {
-    const active = unwrap(await withTimeout(() => namespace.active()))
-    if (active && typeof active === "object") {
-      const ids = new Set<string>()
-      for (const [id, value] of Object.entries(active as Record<string, unknown>)) {
-        if (value) ids.add(id)
-      }
-      return ids
+    const result = await withTimeout(() => namespace.active())
+    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      return new Set(Object.keys(data as Record<string, unknown>))
     }
   }
   if (typeof namespace.status === "function") {
-    const status = unwrap(await withTimeout(() => namespace.status()))
-    if (status && typeof status === "object") {
+    const result = await withTimeout(() => namespace.status())
+    const data = result && typeof result === "object" ? (result as { data?: unknown }).data : undefined
+    if (data && typeof data === "object" && !Array.isArray(data)) {
       const ids = new Set<string>()
-      for (const [id, value] of Object.entries(status as Record<string, any>)) {
-        const state = value?.status ?? value
-        if (state === "busy" || state === "retry") ids.add(id)
+      for (const [id, value] of Object.entries(data as Record<string, any>)) {
+        const type = value && typeof value === "object" ? (value.type ?? value.status) : value
+        if (type === undefined || type === "busy" || type === "retry") ids.add(id)
       }
       return ids
     }
   }
   return undefined
+}
+
+/** Minimal agent-variants sidecar view: which parents exist and which have
+ * the base disabled. Absent file / parse errors -> empty (fail-soft). */
+export type AvSidecar = {
+  parents: Map<string, { disableBase: boolean }>
+}
+
+export function loadAvSidecar(globalConfigDir: string | undefined): AvSidecar {
+  const parents = new Map<string, { disableBase: boolean }>()
+  if (!globalConfigDir) return { parents }
+  try {
+    const path = `${globalConfigDir.replace(/[\\/]+$/, "")}/agent-variants.jsonc`
+    if (!existsSync(path)) return { parents }
+    const raw = readFileSync(path, "utf8")
+    const json = JSON.parse(stripJsoncComments(raw)) as {
+      agents?: Record<string, { disable_base?: boolean; disable?: boolean }>
+    }
+    for (const [parent, entry] of Object.entries(json.agents ?? {})) {
+      if (!entry || typeof entry !== "object") continue
+      parents.set(parent, { disableBase: entry.disable_base === true && entry.disable !== true })
+    }
+  } catch {
+    // Not our file to complain about - AV may simply not be installed.
+  }
+  return { parents }
+}
+
+function stripJsoncComments(text: string): string {
+  // Block comments, line comments, and trailing commas before } or ].
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'\\])\/\/.*$/gm, "$1")
+    .replace(/,(\s*[}\]])/g, "$1")
+}
+
+/** child session id -> the AV variant that created it (from the parent's
+ * task-part metadata). Windowed like AV's own correlation: only recent
+ * history is scanned, deep/old tasks simply stay unattributed. */
+export type VariantAttribution = Map<string, { alias: string; parent: string }>
+
+export async function fetchVariantAttribution(
+  client: unknown,
+  parentSessionID: string | undefined,
+  directory: string | undefined,
+  avParents: Set<string>,
+): Promise<VariantAttribution> {
+  const map: VariantAttribution = new Map()
+  if (avParents.size === 0 || !parentSessionID) return map
+  const namespace = (client as { session?: Record<string, any> } | undefined)?.session
+  if (!namespace || typeof namespace.messages !== "function") return map
+  const messages = await withTimeout(() => {
+    // Try the flat (v2-gen) shape first, then the legacy {query} wrapper.
+    const flat = namespace.messages({ sessionID: parentSessionID, directory, limit: 50 })
+    return flat instanceof Promise ? flat : namespace.messages({ path: { id: parentSessionID }, query: { directory, limit: 50 } })
+  })
+  const list = Array.isArray(messages)
+    ? messages
+    : messages && typeof messages === "object"
+      ? ((messages as { data?: unknown }).data ?? messages)
+      : undefined
+  if (!Array.isArray(list)) return map
+  for (const message of list as Array<{ parts?: Array<Record<string, any>> }>) {
+    for (const part of message.parts ?? []) {
+      if (part?.type !== "tool" || part.tool !== "task") continue
+      const metadata = part.state?.metadata as Record<string, any> | undefined
+      const child = metadata?.sessionId
+      const variantMeta = metadata?.agentVariants as Record<string, unknown> | undefined
+      const alias = variantMeta?.alias
+      const routedAgent = variantMeta?.routedAgent
+      if (typeof child === "string" && typeof alias === "string" && !map.has(child)) {
+        map.set(child, {
+          alias,
+          parent: typeof routedAgent === "string" ? routedAgent : alias.replace(/-[a-z0-9-]+$/, ""),
+        })
+      }
+    }
+  }
+  return map
 }
 
 /** Builds the recursive subagent tree for `rootID`. Unknown-parent sessions
