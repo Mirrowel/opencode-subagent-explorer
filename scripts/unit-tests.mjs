@@ -19,6 +19,7 @@ import {
   loadAvSidecar,
   normalizeSession,
   parentCandidates,
+  rowHidden,
 } from "../dist/sessions.js"
 
 let passed = 0
@@ -199,6 +200,29 @@ class FakeSessionNamespace {
   ok(deleter.calls[0]?.sessionID === "s1", "deleteSession sends the flat param shape first")
   ok((await deleteSession({ session: { remove: (input) => Promise.resolve(false) } }, "s9")) === true, "remove fallback counts a defined response as success")
   ok((await deleteSession({ session: {} }, "s9")) === false, "no delete methods -> false")
+
+  // {error} envelope without data = the runtime's non-throwing failure shape:
+  // must count as a failure, never as a successful delete.
+  {
+    const fake = {
+      session: {
+        delete: async function (input) {
+          if (this !== fake.session) throw new Error("detached")
+          const id = input.sessionID ?? input.path?.sessionID ?? input.id ?? input.path?.id
+          return id === "s_bad" ? { error: "Session not found" } : { data: true }
+        },
+      },
+    }
+    ok((await deleteSession(fake, "s_bad")) === false, "deleteSession treats {error} envelopes as failures")
+    ok((await deleteSession(fake, "s_ok")) === true, "deleteSession treats {data} envelopes as successes")
+  }
+
+  // The 100-row server cap fix: an explicit large limit is always sent.
+  {
+    const limitRecorder = new FakeSessionNamespace("flat-envelope")
+    await fetchSessions({ session: limitRecorder }, "dir")
+    ok(limitRecorder.calls[0]?.limit === 5000, `fetchSessions sends an explicit large limit (got ${JSON.stringify(limitRecorder.calls[0])})`)
+  }
 }
 
 // --- selfwire ---
@@ -325,6 +349,49 @@ class FakeSessionNamespace {
   ok(map.get("ses_plain")?.alias === "plan-basic", "attribution: second variant captured")
   const none = await fetchVariantAttribution(client, "ses_parent", "C:/x", new Set())
   ok(none.size === 0, "attribution: skipped entirely without AV parents")
+
+  // Attribution pages backward through the parent's history via the
+  // `before` message cursor, so large trees attribute old children too.
+  {
+    const queries = []
+    const pageOf = (index) => Array.from({ length: 100 }, (_, i) => ({
+      id: `msg_${index}_${i}`,
+      info: { id: `msg_${index}_${i}` },
+      parts: [{ type: "tool", tool: "task", state: { metadata: { sessionId: `ses_child_${index}_${i}`, agentVariants: { alias: "explore-light", routedAgent: "explore" } } } }],
+    }))
+    const paged = {
+      session: {
+        messages: async function (args) {
+          if (this !== paged.session) throw new Error("detached")
+          queries.push(args)
+          if (args.before === undefined) return { data: pageOf(0) }
+          if (args.before === "msg_0_99") return { data: [...pageOf(1).slice(0, 40), { id: "msg_tail", info: { id: "msg_tail" }, parts: [] }] }
+          return { data: [] }
+        },
+      },
+    }
+    const deep = await fetchVariantAttribution(paged, "ses_parent", "C:/x", new Set(["explore"]))
+    ok(deep.get("ses_child_1_0")?.alias === "explore-light", "attribution: second page children attributed via the before cursor")
+    ok(deep.size === 140, `attribution: pages combined (got ${deep.size})`)
+    ok(queries[1]?.before === "msg_0_99" && queries[1]?.limit === 100, `attribution: cursor + limit carried (got ${JSON.stringify(queries[1])})`)
+  }
+}
+
+// --- badge gating: AV-parent children never hidden-badged ---
+
+{
+  const avParents = new Map([
+    ["explore", { disableBase: true }],
+    ["general", { disableBase: false }],
+  ])
+  const hidden = new Set(["explore", "general", "historian"])
+  const configAgents = new Set(["explore", "general", "build", "plan", "historian"])
+  ok(rowHidden({ alias: "explore-light" }, "explore", avParents, hidden, configAgents) === false, "rowHidden: attributed variant child never badged")
+  ok(rowHidden(undefined, "explore", avParents, hidden, configAgents) === false, "rowHidden: AV-parent child never badged, attribution or not")
+  ok(rowHidden(undefined, "general", avParents, hidden, configAgents) === false, "rowHidden: config-hidden AV parent (unified hiding) never badged")
+  ok(rowHidden(undefined, "historian", avParents, hidden, configAgents) === true, "rowHidden: genuinely hidden non-AV agent stays badged")
+  ok(rowHidden(undefined, "some-plugin-agent", avParents, hidden, configAgents) === true, "rowHidden: runtime-registered agents stay badged")
+  ok(rowHidden(undefined, "build", avParents, hidden, configAgents) === false, "rowHidden: visible config agents never badged")
 }
 
 console.log(`unit tests passed (${passed} checks)`)

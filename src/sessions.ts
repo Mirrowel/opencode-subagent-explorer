@@ -82,16 +82,26 @@ export function normalizeSession(raw: unknown): SessionLite | undefined {
 }
 
 /** Lists sessions for a directory. Tries the v2 client's flat params first,
- * then the v1 `{query}` shape; unwraps both envelope styles. Fail-soft. */
+ * then the v1 `{query}` shape; unwraps both envelope styles. Fail-soft.
+ *
+ * EXPLICIT LARGE LIMIT: OpenCode's Session.list defaults to a 100-row page
+ * (ordered by time_updated DESC, session.ts `limit ?? 100`) - a plain call
+ * silently hides older sessions, which truncated large trees (100+ subagents
+ * showed ~85) and made cleanups miss everything past the first page. The
+ * server imposes no max on limit (NonNegativeInt), and its `start` cursor
+ * filters to NEWER sessions (gte), so downward paging is impossible by
+ * design - one large bounded page is the honest shape. */
+const SESSION_LIST_LIMIT = 5000
+
 export async function fetchSessions(client: unknown, directory: string): Promise<SessionLite[] | undefined> {
   const namespace = (client as { session?: Record<string, any> } | undefined)?.session
   if (!namespace?.list) return undefined
   const calls: (() => Promise<unknown>)[] = [
-    () => namespace.list({ directory }),
-    () => namespace.list({ query: { directory } }),
+    () => namespace.list({ directory, limit: SESSION_LIST_LIMIT }),
+    () => namespace.list({ query: { directory, limit: SESSION_LIST_LIMIT } }),
   ]
   for (const call of calls) {
-    const result = unwrap(await withTimeout(call))
+    const result = unwrap(await withTimeout(call, 8000))
     if (Array.isArray(result)) return result.map(normalizeSession).filter((s): s is SessionLite => !!s)
   }
   return undefined
@@ -170,9 +180,15 @@ function stripJsoncComments(text: string): string {
 }
 
 /** child session id -> the AV variant that created it (from the parent's
- * task-part metadata). Windowed like AV's own correlation: only recent
- * history is scanned, deep/old tasks simply stay unattributed. */
+ * task-part metadata). Paged backward through the parent's history via the
+ * `before` message cursor (up to ATTRIBUTION_PAGES pages), so large trees
+ * attribute most children instead of only the newest ~15 tasks; very deep
+ * history simply stays unattributed (the row then shows the parent agent,
+ * never a hidden badge - see explorerRows). */
 export type VariantAttribution = Map<string, { alias: string; parent: string }>
+
+const ATTRIBUTION_PAGE_SIZE = 100
+const ATTRIBUTION_PAGES = 5
 
 export async function fetchVariantAttribution(
   client: unknown,
@@ -184,32 +200,49 @@ export async function fetchVariantAttribution(
   if (avParents.size === 0 || !parentSessionID) return map
   const namespace = (client as { session?: Record<string, any> } | undefined)?.session
   if (!namespace || typeof namespace.messages !== "function") return map
-  const messages = await withTimeout(() => {
-    // Try the flat (v2-gen) shape first, then the legacy {query} wrapper.
-    const flat = namespace.messages({ sessionID: parentSessionID, directory, limit: 50 })
-    return flat instanceof Promise ? flat : namespace.messages({ path: { id: parentSessionID }, query: { directory, limit: 50 } })
-  })
-  const list = Array.isArray(messages)
-    ? messages
-    : messages && typeof messages === "object"
-      ? ((messages as { data?: unknown }).data ?? messages)
-      : undefined
-  if (!Array.isArray(list)) return map
-  for (const message of list as Array<{ parts?: Array<Record<string, any>> }>) {
-    for (const part of message.parts ?? []) {
-      if (part?.type !== "tool" || part.tool !== "task") continue
-      const metadata = part.state?.metadata as Record<string, any> | undefined
-      const child = metadata?.sessionId
-      const variantMeta = metadata?.agentVariants as Record<string, unknown> | undefined
-      const alias = variantMeta?.alias
-      const routedAgent = variantMeta?.routedAgent
-      if (typeof child === "string" && typeof alias === "string" && !map.has(child)) {
-        map.set(child, {
-          alias,
-          parent: typeof routedAgent === "string" ? routedAgent : alias.replace(/-[a-z0-9-]+$/, ""),
-        })
+  const fetchPage = (before?: string): Promise<unknown> => {
+    const query: Record<string, unknown> = { directory, limit: ATTRIBUTION_PAGE_SIZE }
+    if (before) query.before = before
+    // Try the flat (v2-gen) shape first, then the legacy {path, query} wrapper.
+    const flat = namespace.messages!({ sessionID: parentSessionID, ...query })
+    return flat instanceof Promise ? flat : namespace.messages!({ path: { id: parentSessionID }, query })
+  }
+  const asList = (value: unknown): Array<{ parts?: Array<Record<string, any>> }> | undefined => {
+    if (Array.isArray(value)) return value as Array<{ parts?: Array<Record<string, any>> }>
+    if (value && typeof value === "object") {
+      const unwrapped = (value as { data?: unknown }).data
+      if (Array.isArray(unwrapped)) return unwrapped as Array<{ parts?: Array<Record<string, any>> }>
+    }
+    return undefined
+  }
+  let before: string | undefined
+  const seenCursors = new Set<string>()
+  for (let page = 0; page < ATTRIBUTION_PAGES; page++) {
+    const messages = await withTimeout(() => fetchPage(before), 8000)
+    const list = asList(messages)
+    if (!list || list.length === 0) break
+    for (const message of list) {
+      for (const part of message.parts ?? []) {
+        if (part?.type !== "tool" || part.tool !== "task") continue
+        const metadata = part.state?.metadata as Record<string, any> | undefined
+        const child = metadata?.sessionId
+        const variantMeta = metadata?.agentVariants as Record<string, unknown> | undefined
+        const alias = variantMeta?.alias
+        const routedAgent = variantMeta?.routedAgent
+        if (typeof child === "string" && typeof alias === "string" && !map.has(child)) {
+          map.set(child, {
+            alias,
+            parent: typeof routedAgent === "string" ? routedAgent : alias.replace(/-[a-z0-9-]+$/, ""),
+          })
+        }
       }
     }
+    if (list.length < ATTRIBUTION_PAGE_SIZE) break
+    const last = list[list.length - 1] as { id?: string; info?: { id?: string } }
+    const next = last?.info?.id ?? last?.id
+    if (!next || seenCursors.has(next)) break
+    seenCursors.add(next)
+    before = next
   }
   return map
 }
@@ -309,12 +342,35 @@ export function isHiddenAgent(agent: string | undefined, hidden: Set<string>, co
   return !configAgents.has(agent) && !BUILTIN_AGENTS.has(agent) && !agent.startsWith("av:")
 }
 
+/** Badge decision for explorer rows: variant children and children of
+ * AV-managed parents never carry the hidden badge - a hidden AV parent is
+ * agent-variants' base-disable ("must use a variant"), not a background
+ * agent, and the decision must not depend on attribution windows. Only
+ * genuinely hidden non-AV agents (plugin background agents, hidden custom
+ * agents without variants) keep the badge. */
+export function rowHidden(
+  variant: unknown,
+  agent: string | undefined,
+  avParents: { has: (id: string) => boolean },
+  hidden: Set<string>,
+  configAgents: Set<string>,
+): boolean {
+  if (variant) return false
+  if (agent && avParents.has(agent)) return false
+  return isHiddenAgent(agent, hidden, configAgents)
+}
+
 /** Deletes one session through whichever delete method the host client
  * exposes (`session.delete`, `session.remove`). Returns false when no
- * method exists or the call failed. */
+ * method exists or the call failed. An `{error}` envelope without `data`
+ * (the runtime's non-throwing failure shape) counts as a failure, not a
+ * success - the server's remove handler swallows internal errors and can
+ * still answer, so callers verify after batch deletes. */
 export async function deleteSession(client: unknown, sessionID: string): Promise<boolean> {
   const namespace = (client as { session?: Record<string, any> } | undefined)?.session
   if (!namespace) return false
+  const isErrorEnvelope = (value: unknown): boolean =>
+    !!value && typeof value === "object" && "error" in (value as Record<string, unknown>) && !("data" in (value as Record<string, unknown>))
   const shapes: (() => Promise<unknown>)[] = []
   if (typeof namespace.delete === "function") {
     shapes.push(() => namespace.delete({ sessionID }), () => namespace.delete({ path: { sessionID } }), () => namespace.delete({ path: { id: sessionID } }), () => namespace.delete({ id: sessionID }))
@@ -324,7 +380,9 @@ export async function deleteSession(client: unknown, sessionID: string): Promise
   }
   for (const call of shapes) {
     const result = await withTimeout(call)
-    if (result !== undefined) return true
+    if (result === undefined) continue
+    if (isErrorEnvelope(result)) continue
+    return true
   }
   return false
 }

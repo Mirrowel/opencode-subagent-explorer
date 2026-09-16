@@ -27,9 +27,9 @@ import {
   fetchVariantAttribution,
   formatAge,
   hiddenAgentIDs,
-  isHiddenAgent,
   loadAvSidecar,
   parentCandidates,
+  rowHidden,
   type CleanupPlan,
   type SessionLite,
   type SessionTreeNode,
@@ -97,14 +97,14 @@ export function explorerRows(tree: SessionTreeNode[], data: ExplorerData): Explo
   const walk = (nodes: SessionTreeNode[], depth: number) => {
     for (const node of nodes) {
       const variant = data.variantOf.get(node.session.id)
+      const agent = node.session.agent
       rows.push({
         session: node.session,
         depth,
         running: data.activeIDs?.has(node.session.id) ?? false,
-        // Variant children are normal sessions re-attributed to their alias;
-        // only the base agent itself (or non-AV hidden agents) carries the
-        // hidden badge.
-        hidden: variant ? false : isHiddenAgent(node.session.agent, data.hidden, data.configAgents),
+        // Badge decision is window-independent (see rowHidden): children of
+        // AV-managed parents are never badged, attributed or not.
+        hidden: rowHidden(variant, agent, data.avParents, data.hidden, data.configAgents),
         variant,
       })
       walk(node.children, depth + 1)
@@ -529,7 +529,26 @@ async function deleteOne(api: TuiPluginApi, row: ExplorerRow): Promise<boolean> 
   return ok
 }
 
-async function runCleanup(api: TuiPluginApi, plan: CleanupPlan, rootTitle: string): Promise<number> {
+function CleanupProgressDialog(props: { api: TuiPluginApi; done: () => number; total: number }) {
+  const theme = () => themeOf(props.api)
+  const popMode = props.api.mode.push("subagent-explorer.cleanup")
+  onCleanup(() => popMode())
+  const done = props.done
+  const total = props.total
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={2} paddingBottom={2} gap={1}>
+      <text fg={theme().text}><b>{`Cleaning up idle subagent sessions…`}</b></text>
+      <text fg={theme().textMuted}>{`${done()} / ${total} deleted`}</text>
+      <text fg={theme().textMuted}>{"This dialog closes when the batch finishes."}</text>
+    </box>
+  )
+}
+
+function showCleanupProgress(api: TuiPluginApi, done: () => number, total: number): void {
+  api.ui.dialog.replace(() => <CleanupProgressDialog api={api} done={done} total={total} />, () => {})
+}
+
+async function runCleanup(api: TuiPluginApi, plan: CleanupPlan, rootTitle: string, directory: string, rootID: string): Promise<number> {
   if (plan.deletable.length === 0) {
     await showInfo(api, {
       title: "Nothing to clean up",
@@ -545,16 +564,47 @@ async function runCleanup(api: TuiPluginApi, plan: CleanupPlan, rootTitle: strin
   })
   if (!confirmed) return 0
   let deleted = 0
+  const [progressDone, setProgressDone] = createSignal(0)
+  showCleanupProgress(api, progressDone, plan.deletable.length)
   for (const session of plan.deletable) {
-    if (await deleteSession(api.client, session.id)) deleted += 1
+    if (await deleteSession(api.client, session.id)) {
+      deleted += 1
+      setProgressDone(deleted)
+    }
   }
+  // Verify against a fresh (full, un-capped) fetch: the server's remove
+  // handler swallows internal errors and still answers, and the host may
+  // spawn new children while we work - report what actually remains.
+  const remainingIdle = await remainingIdleCount(api, directory, rootID)
+  api.ui.dialog.clear()
   const failed = plan.deletable.length - deleted
   api.ui.toast({
-    variant: failed > 0 ? "warning" : "default",
+    variant: failed > 0 || remainingIdle > 0 ? "warning" : "default",
     title: "Cleanup finished",
-    message: failed > 0 ? `Deleted ${deleted}, failed ${failed}.` : `Deleted ${deleted} session(s).`,
+    message:
+      remainingIdle > 0
+        ? `Deleted ${deleted}. ${remainingIdle} idle session(s) still remain${failed > 0 ? ` (${failed} delete call(s) failed - re-run cleanup or delete rows individually)` : " - re-run cleanup for the newly-idle"}.`
+        : failed > 0
+          ? `Deleted ${deleted}, failed ${failed}.`
+          : `Deleted ${deleted} session(s).`,
   })
   return deleted
+}
+
+async function remainingIdleCount(api: TuiPluginApi, directory: string, rootID: string): Promise<number> {
+  const sessions = await fetchSessions(api.client, directory)
+  if (!sessions) return 0
+  const active = await fetchActiveSessionIDs(api.client)
+  const rows = explorerRows(buildSessionTree(sessions, rootID), {
+    sessions,
+    activeIDs: active,
+    activeKnown: active !== undefined,
+    hidden: new Set(),
+    configAgents: new Set(),
+    variantOf: new Map(),
+    avParents: new Map(),
+  })
+  return rows.filter((row) => !row.running).length
 }
 
 function showRootPicker(api: TuiPluginApi, sessions: SessionLite[], currentRoot: string | undefined): Promise<string | undefined> {
@@ -881,7 +931,7 @@ export async function mainMenu(api: TuiPluginApi): Promise<void> {
       continue
     }
     if (action.type === "cleanup") {
-      await runCleanup(api, cleanupTargets(tree, data.activeIDs), rootSession?.title ?? rootID)
+      await runCleanup(api, cleanupTargets(tree, data.activeIDs), rootSession?.title ?? rootID, directory, rootID)
       continue
     }
   }
