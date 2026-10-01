@@ -227,7 +227,13 @@ export async function fetchVariantAttribution(
         const metadata = part.state?.metadata as Record<string, any> | undefined
         const child = metadata?.sessionId
         const variantMeta = metadata?.agentVariants as Record<string, unknown> | undefined
-        const alias = variantMeta?.alias
+        // Two alias sources: the after-hook metadata stamp (terminal
+        // completed parts) and the before-hook description annotation -
+        // aborted/error parts never receive the metadata stamp, but the
+        // annotation ("(@alias variant)" appended at call time) persists.
+        const description = part.state?.input?.description
+        const descriptionMatch = typeof description === "string" ? description.match(/\s+\(@(\S+) variant\)$/) : undefined
+        const alias = (typeof variantMeta?.alias === "string" ? variantMeta.alias : undefined) ?? descriptionMatch?.[1]
         const routedAgent = variantMeta?.routedAgent
         if (typeof child === "string" && typeof alias === "string" && !map.has(child)) {
           map.set(child, {

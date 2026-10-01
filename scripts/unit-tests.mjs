@@ -331,6 +331,10 @@ class FakeSessionNamespace {
       parts: [
         { type: "tool", tool: "task", state: { metadata: { sessionId: "ses_light", agentVariants: { alias: "explore-light", routedAgent: "explore" } } } },
         { type: "tool", tool: "task", state: { metadata: { sessionId: "ses_plain", agentVariants: { alias: "plan-basic", routedAgent: "plan" } } } },
+        // Aborted/error parts never get the metadata stamp; the before-hook's
+        // description annotation is the fallback source (mirrors the real
+        // aborted-part shape AV saw in production).
+        { type: "tool", tool: "task", state: { status: "error", input: { subagent_type: "general", description: "M4 round-11 review (fresh bunny) (@general-bunny variant)" }, metadata: { sessionId: "ses_aborted", model: { modelID: "glm-5.3", providerID: "zai-coding-plan" } } } },
       ],
     },
     { parts: [{ type: "text", text: "not a task part" }] },
@@ -347,6 +351,7 @@ class FakeSessionNamespace {
   const map = await fetchVariantAttribution(client, "ses_parent", "C:/x", new Set(["explore", "plan"]))
   ok(map.get("ses_light")?.alias === "explore-light" && map.get("ses_light")?.parent === "explore", "attribution: alias + parent extracted")
   ok(map.get("ses_plain")?.alias === "plan-basic", "attribution: second variant captured")
+  ok(map.get("ses_aborted")?.alias === "general-bunny" && map.get("ses_aborted")?.parent === "general", "attribution: aborted part attributes via the description annotation")
   const none = await fetchVariantAttribution(client, "ses_parent", "C:/x", new Set())
   ok(none.size === 0, "attribution: skipped entirely without AV parents")
 
