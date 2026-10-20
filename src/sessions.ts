@@ -146,29 +146,76 @@ export async function fetchActiveSessionIDs(client: unknown): Promise<Set<string
 }
 
 /** Minimal agent-variants sidecar view: which parents exist and which have
- * the base disabled. Absent file / parse errors -> empty (fail-soft). */
+ * the base disabled, plus the full alias set (variant name -> parent) used
+ * to validate parsed annotations. Absent file / parse errors -> empty
+ * (fail-soft). */
 export type AvSidecar = {
   parents: Map<string, { disableBase: boolean }>
+  aliases: Map<string, string>
 }
 
 export function loadAvSidecar(globalConfigDir: string | undefined): AvSidecar {
   const parents = new Map<string, { disableBase: boolean }>()
-  if (!globalConfigDir) return { parents }
+  const aliases = new Map<string, string>()
+  if (!globalConfigDir) return { parents, aliases }
   try {
     const path = `${globalConfigDir.replace(/[\\/]+$/, "")}/agent-variants.jsonc`
-    if (!existsSync(path)) return { parents }
+    if (!existsSync(path)) return { parents, aliases }
     const raw = readFileSync(path, "utf8")
     const json = JSON.parse(stripJsoncComments(raw)) as {
-      agents?: Record<string, { disable_base?: boolean; disable?: boolean }>
+      agents?: Record<string, { disable_base?: boolean; disable?: boolean; variants?: Record<string, { name?: string; disable?: boolean }> }>
     }
     for (const [parent, entry] of Object.entries(json.agents ?? {})) {
       if (!entry || typeof entry !== "object") continue
       parents.set(parent, { disableBase: entry.disable_base === true && entry.disable !== true })
+      // Alias = the variant's custom name when set, else parent-key (mirrors
+      // AV's variantName) - the validation set for annotation parsing.
+      for (const [key, variant] of Object.entries(entry.variants ?? {})) {
+        if (!variant || typeof variant !== "object" || variant.disable === true) continue
+        const alias = typeof variant.name === "string" && variant.name !== "" ? variant.name : `${parent}-${key}`
+        aliases.set(alias, parent)
+      }
     }
   } catch {
     // Not our file to complain about - AV may simply not be installed.
   }
-  return { parents }
+  return { parents, aliases }
+}
+
+/** One annotation token in any historical form: legacy "(@x variant)",
+ * terse "(@x)", switch "(@x ← y)". Mirrors AV's parseVariantAnnotation. */
+const ANNOTATION_TOKEN = /\(@\s*([^()@←]*?)\s*(?:\s+variant)?\s*(?:\s*←\s*([^()@←]*?))?\s*\)/g
+
+/** OpenCode's own task-title suffix " (@agent subagent)" (task.ts appends it
+ * on agent-switch resumes, always AFTER our note) matches the terse form
+ * grammatically - excluded explicitly or it would override the true alias
+ * under last-wins. */
+const NATIVE_TITLE_SUFFIX = /^[^\s]+ subagent$/
+
+/** Reads the last VALID variant annotation from a text. Native suffixes are
+ * never evidence. */
+export function parseVariantAnnotation(text: string | undefined): { alias: string; switchedFrom?: string } | undefined {
+  if (typeof text !== "string") return undefined
+  let last: { alias: string; switchedFrom?: string } | undefined
+  for (const match of text.matchAll(ANNOTATION_TOKEN)) {
+    const alias = (match[1] ?? "").trim()
+    if (alias === "" || NATIVE_TITLE_SUFFIX.test(alias)) continue
+    const switchedFrom = (match[2] ?? "").trim()
+    last = switchedFrom === "" ? { alias } : { alias, switchedFrom }
+  }
+  return last
+}
+
+/** Title-annotation fallback for children beyond the attribution walk's
+ * depth: AV writes the annotation into the child's session title at call
+ * time and it survives forever, so it attributes what the windowed walk
+ * cannot reach. Validated against the sidecar's alias set - an unknown
+ * token never attributes. */
+export function variantFromTitle(title: string | undefined, sidecar: AvSidecar): { alias: string; parent: string } | undefined {
+  const alias = parseVariantAnnotation(title)?.alias
+  if (alias === undefined || sidecar.aliases.size === 0) return undefined
+  const parent = sidecar.aliases.get(alias)
+  return parent !== undefined ? { alias, parent } : undefined
 }
 
 function stripJsoncComments(text: string): string {
@@ -230,12 +277,10 @@ export async function fetchVariantAttribution(
         // Two alias sources: the after-hook metadata stamp (terminal
         // completed parts) and the before-hook description annotation -
         // aborted/error parts never receive the metadata stamp, but the
-        // annotation persists. Reads every historical annotation form:
-        // legacy "(@x variant)", terse "(@x)", switch "(@x ← y)".
+        // annotation persists. The shared parser excludes OpenCode's native
+        // "(@agent subagent)" suffix, which would otherwise win last-wins.
         const description: unknown = part.state?.input?.description
-        const descriptionMatch =
-          typeof description === "string" ? [...description.matchAll(/\(@\s*([^()@←]*?)\s*(?:\s+variant)?\s*(?:\s*←\s*[^()@←]*?)?\s*\)/g)].at(-1) : undefined
-        const descriptionAlias = (descriptionMatch?.[1] ?? "").trim()
+        const descriptionAlias = parseVariantAnnotation(typeof description === "string" ? description : undefined)?.alias
         const alias = (typeof variantMeta?.alias === "string" ? variantMeta.alias : undefined) ?? (descriptionAlias !== "" ? descriptionAlias : undefined)
         const routedAgent = variantMeta?.routedAgent
         if (typeof child === "string" && typeof alias === "string" && !map.has(child)) {

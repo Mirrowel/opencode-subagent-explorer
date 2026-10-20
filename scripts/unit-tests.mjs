@@ -19,7 +19,9 @@ import {
   loadAvSidecar,
   normalizeSession,
   parentCandidates,
+  parseVariantAnnotation,
   rowHidden,
+  variantFromTitle,
 } from "../dist/sessions.js"
 
 let passed = 0
@@ -308,7 +310,7 @@ class FakeSessionNamespace {
     `// agent-variants sidecar
 {
   "agents": {
-    "explore": { "parent": {}, "disable_base": true, "variants": { "explore-light": {} } },
+    "explore": { "parent": {}, "disable_base": true, "variants": { "seek": { "name": "explore-seek" }, "bunny": {}, "gone": { "disable": true } } },
     "general": { "parent": {}, "disable_base": true, "disable": true, "variants": {} },
     "plan": { "parent": {}, "variants": {} },
   },
@@ -320,7 +322,34 @@ class FakeSessionNamespace {
   ok(sidecar.parents.get("general")?.disableBase === false, "sidecar: full disable beats disable_base")
   ok(sidecar.parents.get("plan")?.disableBase === false, "sidecar: plain parent not base-disabled")
   ok(sidecar.parents.size === 3, "sidecar: all parents parsed (comments tolerated)")
+  ok(sidecar.aliases.get("explore-seek") === "explore", "sidecar: custom variant name -> alias")
+  ok(sidecar.aliases.get("explore-bunny") === "explore", "sidecar: unnamed variant -> parent-key alias (mirrors AV's variantName)")
+  ok(!sidecar.aliases.has("explore-gone"), "sidecar: disabled variants excluded from the alias set")
   rmSync(home, { recursive: true, force: true })
+}
+
+// --- AV awareness: hardened annotation parsing + title fallback ---
+
+{
+  // OpenCode's native " (@agent subagent)" title suffix (appended on
+  // agent-switch resumes, always AFTER our note) is grammatically identical
+  // to the terse form - it must never be alias evidence (live incident: AV
+  // candidate rows rendered "- general subagent").
+  ok(parseVariantAnnotation("Docs review (@general-seek) (@general subagent)")?.alias === "general-seek", "parser: native suffix excluded, our note wins")
+  ok(parseVariantAnnotation("Find stray (@general subagent)") === undefined, "parser: native-only never attributes")
+  ok(parseVariantAnnotation("Resume (@general-light ← explore-seek) (@general subagent)")?.alias === "general-light", "parser: switch form survives a trailing native suffix")
+  ok(parseVariantAnnotation("Run (@general-bunny variant)")?.alias === "general-bunny", "parser: legacy form still parses")
+  ok(parseVariantAnnotation(undefined) === undefined, "parser: undefined tolerated")
+
+  // Title fallback: validates against the sidecar's alias set; unknown
+  // tokens and empty sidecars never attribute.
+  const sidecar = { parents: new Map(), aliases: new Map([["general-seek", "general"], ["explore-bunny", "explore"]]) }
+  const attributed = variantFromTitle("Docs review: LLM onboarding (@general-seek) (@general subagent)", sidecar)
+  ok(attributed?.alias === "general-seek" && attributed?.parent === "general", "title fallback: validated annotation attributes with its parent")
+  ok(variantFromTitle("Odd job (@not-a-variant) (@general subagent)", sidecar) === undefined, "title fallback: unknown tokens never attribute")
+  ok(variantFromTitle("Find stray (@general subagent)", sidecar) === undefined, "title fallback: native-only titles never attribute")
+  ok(variantFromTitle("Docs review (@general-seek)", { parents: new Map(), aliases: new Map() }) === undefined, "title fallback: empty sidecar (AV absent) never attributes")
+  ok(variantFromTitle(undefined, sidecar) === undefined, "title fallback: untitled session tolerated")
 }
 
 // --- AV awareness: variant attribution from task-part metadata ---

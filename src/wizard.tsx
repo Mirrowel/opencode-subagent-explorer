@@ -30,6 +30,8 @@ import {
   loadAvSidecar,
   parentCandidates,
   rowHidden,
+  variantFromTitle,
+  type AvSidecar,
   type CleanupPlan,
   type SessionLite,
   type SessionTreeNode,
@@ -54,6 +56,8 @@ export type ExplorerData = {
   variantOf: VariantAttribution
   /** AV sidecar parents (empty when agent-variants is not installed). */
   avParents: Map<string, { disableBase: boolean }>
+  /** The full sidecar view - the alias set validates title annotations. */
+  avSidecar: AvSidecar
 }
 
 export type TreeAction =
@@ -89,6 +93,7 @@ export async function loadExplorerData(api: TuiPluginApi, directory: string, roo
     configAgents: configAgentIDs(api.state.config),
     variantOf,
     avParents: avSidecar.parents,
+    avSidecar,
   }
 }
 
@@ -96,7 +101,10 @@ export function explorerRows(tree: SessionTreeNode[], data: ExplorerData): Explo
   const rows: ExplorerRow[] = []
   const walk = (nodes: SessionTreeNode[], depth: number) => {
     for (const node of nodes) {
-      const variant = data.variantOf.get(node.session.id)
+      // Attribution: windowed metadata/description walk first, then the
+      // title annotation (AV's call-time writing, carried forever - reaches
+      // children the walk cannot).
+      const variant = data.variantOf.get(node.session.id) ?? variantFromTitle(node.session.title, data.avSidecar)
       const agent = node.session.agent
       rows.push({
         session: node.session,
@@ -603,6 +611,7 @@ async function remainingIdleCount(api: TuiPluginApi, directory: string, rootID: 
     configAgents: new Set(),
     variantOf: new Map(),
     avParents: new Map(),
+    avSidecar: { parents: new Map(), aliases: new Map() },
   })
   return rows.filter((row) => !row.running).length
 }
