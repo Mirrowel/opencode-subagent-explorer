@@ -1,6 +1,6 @@
 {
   "name": "@mirrowel/opencode-subagent-explorer",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.6",
   "type": "module",
   "description": "OpenCode plugin for exploring and cleaning up subagent sessions of the current session",
   "license": "MIT",
@@ -63,7 +63,8 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "scripts": {    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui",
     "build:tui": "bun scripts/build-tui.mjs",
     "ci": "npm run ci:package",
